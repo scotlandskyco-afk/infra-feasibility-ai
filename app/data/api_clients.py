@@ -1,200 +1,123 @@
 """
-Phase 1 — Real Data API Clients
-Sources: World Bank, NASA POWER, ElectricityMap
+API clients for World Bank and NASA POWER data sources.
+All methods use the local JSON cache to avoid redundant network calls.
+Fallback synthetic data is returned when the network is unavailable.
 """
-import os
+
+import logging
+from typing import Dict, Optional
+
 import requests
-import httpx
-from datetime import datetime, timedelta
-from typing import Optional
-from dotenv import load_dotenv
-from app.cache.cache_manager import get_cached, set_cached
 
-load_dotenv()
+from app.data.cache import JSONCache
+from app.data.cleaners import clean_worldbank_series, clean_nasa_solar
 
-WORLD_BANK_BASE = os.getenv("WORLD_BANK_BASE_URL", "https://api.worldbank.org/v2")
-NASA_POWER_BASE = os.getenv("NASA_POWER_BASE_URL", "https://power.larc.nasa.gov/api/temporal/daily/point")
-ELECTRICITYMAP_BASE = os.getenv("ELECTRICITYMAP_BASE_URL", "https://api.electricitymap.org/v3")
-ELECTRICITYMAP_KEY = os.getenv("ELECTRICITYMAP_API_KEY", "")
+logger = logging.getLogger(__name__)
+
+WB_BASE = "https://api.worldbank.org/v2"
+NASA_BASE = "https://power.larc.nasa.gov/api/temporal/monthly/point"
+
+_cache = JSONCache()
 
 
 class WorldBankClient:
-    """
-    Fetches macroeconomic indicators from the World Bank Open Data API.
-    No API key required.
-    Indicators:
-        NY.GDP.MKTP.KD.ZG  — GDP growth (%)
-        FP.CPI.TOTL.ZG      — Inflation (CPI %)
-        SP.POP.TOTL         — Population
-        EG.USE.PCAP.KG.OE   — Energy use per capita (kg oil eq)
-    """
+    """Fetches macroeconomic indicators from the World Bank Open Data API v2."""
 
     INDICATORS = {
-        "gdp_growth": "NY.GDP.MKTP.KD.ZG",
+        "gdp": "NY.GDP.MKTP.CD",
         "inflation": "FP.CPI.TOTL.ZG",
         "population": "SP.POP.TOTL",
-        "energy_use_per_capita": "EG.USE.PCAP.KG.OE",
+        "energy_use": "EG.USE.PCAP.KG.OE",
     }
 
-    def fetch_indicator(self, country_code: str, indicator_key: str, years: int = 5) -> dict:
-        """Fetch a single indicator for a country over recent years."""
-        cache_key = f"wb_{country_code}_{indicator_key}_{years}"
-        cached = get_cached(cache_key)
-        if cached:
+    # Synthetic fallback values per indicator (used when API is unavailable)
+    FALLBACK = {
+        "gdp": {y: 200_000_000_000.0 for y in range(2015, 2025)},
+        "inflation": {y: 4.5 for y in range(2015, 2025)},
+        "population": {y: 40_000_000 for y in range(2015, 2025)},
+        "energy_use": {y: 1500.0 for y in range(2015, 2025)},
+    }
+
+    def _fetch_indicator(
+        self, country_code: str, indicator: str, years: int
+    ) -> Dict[int, Optional[float]]:
+        """Core fetch method shared by all indicator helpers."""
+        cache_key = f"wb_{country_code}_{indicator}_{years}"
+        cached = _cache.get(cache_key)
+        if cached is not None:
             return cached
 
-        indicator_code = self.INDICATORS.get(indicator_key)
-        if not indicator_code:
-            raise ValueError(f"Unknown indicator: {indicator_key}")
-
-        end_year = datetime.now().year - 1
-        start_year = end_year - years
         url = (
-            f"{WORLD_BANK_BASE}/country/{country_code}/indicator/{indicator_code}"
-            f"?format=json&date={start_year}:{end_year}&per_page=10"
+            f"{WB_BASE}/country/{country_code}/indicator/{indicator}"
+            f"?format=json&per_page={years}&mrv={years}"
         )
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            raw = resp.json()
+            data = clean_worldbank_series(raw)
+            _cache.set(cache_key, data, ttl_hours=48)
+            return data
+        except Exception as exc:
+            logger.warning("World Bank API error (%s): %s", indicator, exc)
+            return {}
 
-        result = {
-            "country": country_code,
-            "indicator": indicator_key,
-            "data": [
-                {"year": entry["date"], "value": entry["value"]}
-                for entry in data[1]
-                if entry["value"] is not None
-            ],
-        }
-        set_cached(cache_key, result)
-        return result
+    def fetch_gdp(self, country_code: str, years: int = 10) -> Dict[int, Optional[float]]:
+        """Fetch GDP (current USD) for country."""
+        return self._fetch_indicator(country_code, self.INDICATORS["gdp"], years) or self.FALLBACK["gdp"]
 
-    def fetch_all_indicators(self, country_code: str) -> dict:
-        """Fetch all macro indicators for a country."""
-        result = {}
-        for key in self.INDICATORS:
-            try:
-                result[key] = self.fetch_indicator(country_code, key)
-            except Exception as e:
-                result[key] = {"error": str(e)}
-        return result
+    def fetch_inflation(self, country_code: str, years: int = 10) -> Dict[int, Optional[float]]:
+        """Fetch CPI inflation (annual %) for country."""
+        return self._fetch_indicator(country_code, self.INDICATORS["inflation"], years) or self.FALLBACK["inflation"]
 
-    def get_latest_value(self, country_code: str, indicator_key: str) -> Optional[float]:
-        """Return the most recent non-null value for an indicator."""
-        data = self.fetch_indicator(country_code, indicator_key)
-        entries = data.get("data", [])
-        if not entries:
-            return None
-        return entries[0]["value"]
+    def fetch_population(self, country_code: str, years: int = 10) -> Dict[int, Optional[float]]:
+        """Fetch total population for country."""
+        return self._fetch_indicator(country_code, self.INDICATORS["population"], years) or self.FALLBACK["population"]
+
+    def fetch_energy_use(self, country_code: str, years: int = 10) -> Dict[int, Optional[float]]:
+        """Fetch energy use per capita (kg of oil equivalent) for country."""
+        return self._fetch_indicator(country_code, self.INDICATORS["energy_use"], years) or self.FALLBACK["energy_use"]
 
 
 class NASAPowerClient:
-    """
-    Fetches solar irradiance and temperature data from NASA POWER API.
-    No API key required.
-    Parameters:
-        ALLSKY_SFC_SW_DWN — All-sky surface shortwave downward irradiance (GHI, kWh/m2/day)
-        T2M               — Temperature at 2 metres (Celsius)
-    """
+    """Fetches solar irradiance and temperature data from NASA POWER API."""
 
-    def fetch_solar_data(
+    # Default fallback: monthly GHI for a typical MENA location (kWh/m2/day)
+    FALLBACK_GHI = {1: 3.2, 2: 4.1, 3: 5.5, 4: 6.8, 5: 7.8, 6: 8.2,
+                    7: 7.9, 8: 7.5, 9: 6.4, 10: 5.0, 11: 3.6, 12: 2.9}
+    FALLBACK_TEMP = {m: 22.0 for m in range(1, 13)}
+
+    def fetch_solar(
         self,
-        latitude: float,
-        longitude: float,
-        start_date: str = None,
-        end_date: str = None,
-    ) -> dict:
-        """
-        Fetch daily solar irradiance and temperature for a location.
-        Dates format: YYYYMMDD
-        Defaults to last 365 days.
-        """
-        if not start_date:
-            start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
-        if not end_date:
-            end_date = (datetime.now() - timedelta(days=2)).strftime("%Y%m%d")
-
-        cache_key = f"nasa_{latitude}_{longitude}_{start_date}_{end_date}"
-        cached = get_cached(cache_key)
-        if cached:
+        lat: float,
+        lon: float,
+        start_year: int = 2015,
+        end_year: int = 2022,
+    ) -> Dict[str, Dict[int, float]]:
+        """Fetch monthly average GHI and 2m temperature for a lat/lon point."""
+        cache_key = f"nasa_{lat}_{lon}_{start_year}_{end_year}"
+        cached = _cache.get(cache_key)
+        if cached is not None:
             return cached
 
         params = {
             "parameters": "ALLSKY_SFC_SW_DWN,T2M",
             "community": "RE",
-            "longitude": longitude,
-            "latitude": latitude,
-            "start": start_date,
-            "end": end_date,
+            "longitude": lon,
+            "latitude": lat,
+            "start": start_year,
+            "end": end_year,
             "format": "JSON",
         }
-        response = requests.get(NASA_POWER_BASE, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            resp = requests.get(NASA_BASE, params=params, timeout=30)
+            resp.raise_for_status()
+            raw = resp.json()
+            data = clean_nasa_solar(raw)
+            if data["GHI"]:
+                _cache.set(cache_key, data, ttl_hours=168)  # 1 week
+                return data
+        except Exception as exc:
+            logger.warning("NASA POWER API error: %s", exc)
 
-        properties = data.get("properties", {}).get("parameter", {})
-        ghi_data = properties.get("ALLSKY_SFC_SW_DWN", {})
-        temp_data = properties.get("T2M", {})
-
-        result = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "start_date": start_date,
-            "end_date": end_date,
-            "ghi_daily_kwh_m2": ghi_data,
-            "temperature_2m_celsius": temp_data,
-            "annual_ghi_kwh_m2": sum(v for v in ghi_data.values() if v and v > 0),
-            "mean_temperature": (
-                sum(v for v in temp_data.values() if v is not None)
-                / len([v for v in temp_data.values() if v is not None])
-                if temp_data
-                else None
-            ),
-        }
-        set_cached(cache_key, result)
-        return result
-
-    def get_annual_ghi(self, latitude: float, longitude: float) -> float:
-        """Return annual GHI in kWh/m2/year for a location."""
-        data = self.fetch_solar_data(latitude, longitude)
-        return data.get("annual_ghi_kwh_m2", 1600.0)
-
-
-class ElectricityMapClient:
-    """
-    Fetches grid carbon intensity and energy mix from ElectricityMap.
-    Requires a free API key from electricitymap.org
-    """
-
-    def __init__(self):
-        self.headers = {"auth-token": ELECTRICITYMAP_KEY}
-
-    def get_carbon_intensity(self, zone: str) -> dict:
-        """Fetch current carbon intensity for a grid zone (e.g. 'GB', 'DE', 'US-CAL-CISO')."""
-        cache_key = f"emap_ci_{zone}"
-        cached = get_cached(cache_key, ttl_hours=1)
-        if cached:
-            return cached
-
-        url = f"{ELECTRICITYMAP_BASE}/carbon-intensity/latest?zone={zone}"
-        response = requests.get(url, headers=self.headers, timeout=15)
-        if response.status_code == 200:
-            result = response.json()
-            set_cached(cache_key, result, ttl_hours=1)
-            return result
-        return {"zone": zone, "carbonIntensity": None, "error": response.text}
-
-    def get_power_breakdown(self, zone: str) -> dict:
-        """Fetch current power production breakdown for a zone."""
-        cache_key = f"emap_pb_{zone}"
-        cached = get_cached(cache_key, ttl_hours=1)
-        if cached:
-            return cached
-
-        url = f"{ELECTRICITYMAP_BASE}/power-breakdown/latest?zone={zone}"
-        response = requests.get(url, headers=self.headers, timeout=15)
-        if response.status_code == 200:
-            result = response.json()
-            set_cached(cache_key, result, ttl_hours=1)
-            return result
-        return {"zone": zone, "error": response.text}
+        return {"GHI": self.FALLBACK_GHI, "TEMP": self.FALLBACK_TEMP}

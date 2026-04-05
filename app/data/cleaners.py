@@ -1,69 +1,72 @@
 """
-Phase 1 — Data Cleaners
-Normalize and validate API responses for downstream modelling.
+Data cleaning and normalisation utilities for World Bank and NASA POWER responses.
 """
-from typing import Optional
-import pandas as pd
+
+from typing import Dict, List, Optional
 
 
-def clean_world_bank_series(raw: dict) -> pd.DataFrame:
+def clean_worldbank_series(raw: list) -> Dict[int, Optional[float]]:
     """
-    Convert World Bank indicator fetch result to a clean DataFrame.
-    Returns: DataFrame with columns [year, value]
+    Extract a clean {year: value} dict from a World Bank API v2 response.
+    The response is a list of two elements; the second is the data array.
     """
-    entries = raw.get("data", [])
-    if not entries:
-        return pd.DataFrame(columns=["year", "value"])
-    df = pd.DataFrame(entries)
-    df["year"] = pd.to_numeric(df["year"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["value"]).sort_values("year", ascending=False).reset_index(drop=True)
-    return df
+    result: Dict[int, Optional[float]] = {}
+    if not raw or len(raw) < 2:
+        return result
+    for entry in raw[1] or []:
+        try:
+            year = int(entry["date"])
+            value = float(entry["value"]) if entry["value"] is not None else None
+            result[year] = value
+        except (KeyError, TypeError, ValueError):
+            continue
+    return dict(sorted(result.items()))
 
 
-def clean_nasa_solar(raw: dict) -> dict:
+def clean_nasa_solar(raw: dict) -> Dict[str, Dict[int, float]]:
     """
-    Clean and validate NASA POWER solar data.
-    Returns dict with annual_ghi, mean_temp, daily_series.
+    Extract monthly GHI and temperature averages from NASA POWER API response.
+    Returns {"GHI": {month_num: value}, "TEMP": {month_num: value}}.
     """
-    ghi = raw.get("ghi_daily_kwh_m2", {})
-    temp = raw.get("temperature_2m_celsius", {})
+    result: Dict[str, Dict[int, float]] = {"GHI": {}, "TEMP": {}}
+    try:
+        params = raw["properties"]["parameter"]
+        ghi_data = params.get("ALLSKY_SFC_SW_DWN", {})
+        temp_data = params.get("T2M", {})
 
-    valid_ghi = {k: v for k, v in ghi.items() if v and v > 0}
-    valid_temp = {k: v for k, v in temp.items() if v is not None}
+        monthly_ghi: Dict[int, List[float]] = {m: [] for m in range(1, 13)}
+        monthly_temp: Dict[int, List[float]] = {m: [] for m in range(1, 13)}
 
-    annual_ghi = sum(valid_ghi.values())
-    mean_temp = sum(valid_temp.values()) / len(valid_temp) if valid_temp else None
+        for key, val in ghi_data.items():
+            if val is not None and val != -999:
+                try:
+                    month = int(key[-2:])
+                    if 1 <= month <= 12:
+                        monthly_ghi[month].append(float(val))
+                except (ValueError, IndexError):
+                    pass
 
-    return {
-        "latitude": raw.get("latitude"),
-        "longitude": raw.get("longitude"),
-        "annual_ghi_kwh_m2": round(annual_ghi, 2),
-        "mean_temp_celsius": round(mean_temp, 2) if mean_temp else None,
-        "daily_ghi": valid_ghi,
-        "daily_temp": valid_temp,
-        "data_points": len(valid_ghi),
-    }
+        for key, val in temp_data.items():
+            if val is not None and val != -999:
+                try:
+                    month = int(key[-2:])
+                    if 1 <= month <= 12:
+                        monthly_temp[month].append(float(val))
+                except (ValueError, IndexError):
+                    pass
+
+        result["GHI"] = {m: sum(v) / len(v) for m, v in monthly_ghi.items() if v}
+        result["TEMP"] = {m: sum(v) / len(v) for m, v in monthly_temp.items() if v}
+    except (KeyError, TypeError):
+        pass
+    return result
 
 
-def extract_latest_wb_value(indicator_data: dict) -> Optional[float]:
-    """Extract the most recent value from a World Bank indicator result."""
-    df = clean_world_bank_series(indicator_data)
-    if df.empty:
-        return None
-    return float(df.iloc[0]["value"])
-
-
-def normalize_country_code(country_input: str) -> str:
+def normalise_to_annual(monthly_dict: Dict[int, float]) -> float:
     """
-    Normalize country input to ISO 3166-1 alpha-3 for World Bank.
-    Accepts 2-letter or 3-letter codes; passes through unknown.
+    Average a {month: value} dict to a single annual mean.
     """
-    mapping = {
-        "GB": "GBR", "US": "USA", "DE": "DEU", "FR": "FRA",
-        "IQ": "IRQ", "KZ": "KAZ", "SL": "SLE", "MG": "MDG",
-        "PK": "PAK", "SA": "SAU", "AE": "ARE", "NG": "NGA",
-        "KE": "KEN", "ET": "ETH", "EG": "EGY", "ZA": "ZAF",
-    }
-    code = country_input.upper().strip()
-    return mapping.get(code, code)
+    values = [v for v in monthly_dict.values() if v is not None]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)

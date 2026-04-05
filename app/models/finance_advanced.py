@@ -1,204 +1,184 @@
 """
-Phase 3 — Advanced Financial Modelling
-NPV, IRR, LCOE, DCF, Monte Carlo simulation
+Advanced financial model with LCOE, NPV, IRR, DCF cash flows,
+debt/equity structuring, and Monte Carlo simulation.
 """
+
+import logging
+import random
+from typing import Dict, List
+
 import numpy as np
 import numpy_financial as npf
-from typing import List, Optional
-import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
-class FinancialModel:
+class AdvancedFinancialModel:
     """
-    Full financial analysis for infrastructure and energy projects.
+    Computes full project finance metrics for an infrastructure investment.
 
-    Parameters:
-        capex_usd           — Total capital expenditure (USD)
-        annual_production_mwh — Annual energy generation (MWh)
-        electricity_price_usd — Electricity sale price (USD/MWh)
-        opex_annual_usd     — Annual operating cost (USD)
-        project_life_years  — Project lifetime (years)
-        discount_rate       — Weighted average cost of capital (decimal, e.g. 0.10)
-        degradation_rate    — Annual panel/turbine output degradation (decimal)
-        debt_fraction       — Share of CAPEX financed by debt (0–1)
-        debt_interest_rate  — Annual debt interest rate (decimal)
+    All monetary values in USD. All rates as decimal fractions (0.08 = 8%).
     """
 
     def __init__(
         self,
         capex_usd: float,
-        annual_production_mwh: float,
-        electricity_price_usd: float = 65.0,
-        opex_annual_usd: Optional[float] = None,
+        opex_annual_usd: float,
+        annual_energy_mwh: float,
+        electricity_price_usd_per_mwh: float,
+        discount_rate: float,
         project_life_years: int = 25,
-        discount_rate: float = 0.10,
-        degradation_rate: float = 0.005,
-        debt_fraction: float = 0.70,
-        debt_interest_rate: float = 0.055,
+        debt_ratio: float = 0.70,
+        debt_interest: float = 0.06,
     ):
         self.capex = capex_usd
-        self.annual_production = annual_production_mwh
-        self.electricity_price = electricity_price_usd
-        self.opex = opex_annual_usd if opex_annual_usd is not None else capex_usd * 0.015
-        self.life = project_life_years
+        self.opex = opex_annual_usd
+        self.energy = annual_energy_mwh
+        self.price = electricity_price_usd_per_mwh
         self.discount_rate = discount_rate
-        self.degradation = degradation_rate
-        self.debt_fraction = debt_fraction
-        self.debt_rate = debt_interest_rate
+        self.life = project_life_years
+        self.debt_ratio = debt_ratio
+        self.debt_interest = debt_interest
 
-    def cash_flows(self) -> List[float]:
-        """Generate annual net cash flows over project life."""
-        flows = [-self.capex]
-        for year in range(1, self.life + 1):
-            production = self.annual_production * ((1 - self.degradation) ** (year - 1))
-            revenue = production * self.electricity_price
-            debt_service = (
-                (self.capex * self.debt_fraction * self.debt_rate)
-                / (1 - (1 + self.debt_rate) ** -20)
-                if year <= 20 else 0
+        # Derived financing
+        self.debt = capex_usd * debt_ratio
+        self.equity = capex_usd * (1 - debt_ratio)
+        # Annual debt service (equal annual payment)
+        if debt_interest > 0 and project_life_years > 0:
+            self.annual_debt_service = (
+                self.debt
+                * (debt_interest * (1 + debt_interest) ** project_life_years)
+                / ((1 + debt_interest) ** project_life_years - 1)
             )
-            net_cf = revenue - self.opex - debt_service
-            flows.append(net_cf)
-        return flows
+        else:
+            self.annual_debt_service = self.debt / max(project_life_years, 1)
 
-    def npv(self) -> float:
-        """Net Present Value (USD)"""
-        return round(float(npf.npv(self.discount_rate, self.cash_flows())), 2)
-
-    def irr(self) -> float:
-        """Internal Rate of Return (%)"""
-        flows = self.cash_flows()
-        try:
-            irr_val = npf.irr(flows)
-            return round(float(irr_val) * 100, 2) if not np.isnan(irr_val) else None
-        except Exception:
-            return None
-
-    def payback_period(self) -> float:
-        """Simple payback period (years)"""
-        flows = self.cash_flows()
-        cumulative = 0.0
-        for i, cf in enumerate(flows):
-            cumulative += cf
-            if cumulative >= 0:
-                return round(float(i), 1)
-        return float(self.life)
-
-    def lcoe(self) -> float:
+    def build_cash_flows(self) -> List[Dict]:
         """
-        Levelized Cost of Energy (USD/MWh)
-        LCOE = PV(total costs) / PV(total energy)
+        Generate a year-by-year cash flow table.
+        Year 0 is the equity investment (negative).
+        Years 1–N: Revenue - OPEX - Debt Service.
         """
-        total_cost_pv = self.capex
-        total_energy_pv = 0.0
-        for year in range(1, self.life + 1):
-            disc = (1 + self.discount_rate) ** year
-            energy = self.annual_production * ((1 - self.degradation) ** (year - 1))
-            total_cost_pv += self.opex / disc
-            total_energy_pv += energy / disc
-        return round(total_cost_pv / total_energy_pv, 2) if total_energy_pv > 0 else None
-
-    def dcf_table(self) -> pd.DataFrame:
-        """Generate full discounted cash flow table."""
         rows = []
-        for year in range(self.life + 1):
-            if year == 0:
-                rows.append({"year": 0, "revenue": 0, "opex": 0, "net_cf": -self.capex, "discounted_cf": -self.capex})
-            else:
-                production = self.annual_production * ((1 - self.degradation) ** (year - 1))
-                revenue = production * self.electricity_price
-                debt_service = (
-                    (self.capex * self.debt_fraction * self.debt_rate)
-                    / (1 - (1 + self.debt_rate) ** -20)
-                    if year <= 20 else 0
-                )
-                net_cf = revenue - self.opex - debt_service
-                disc_cf = net_cf / ((1 + self.discount_rate) ** year)
-                rows.append({
-                    "year": year,
-                    "revenue": round(revenue, 0),
-                    "opex": round(self.opex, 0),
-                    "debt_service": round(debt_service, 0),
-                    "net_cf": round(net_cf, 0),
-                    "discounted_cf": round(disc_cf, 0),
-                })
-        return pd.DataFrame(rows)
+        # Year 0: equity outflow
+        rows.append({
+            "year": 0,
+            "revenue": 0.0,
+            "opex": 0.0,
+            "debt_service": 0.0,
+            "net_cash_flow": -self.equity,
+        })
+        for yr in range(1, self.life + 1):
+            revenue = self.energy * self.price
+            net = revenue - self.opex - self.annual_debt_service
+            rows.append({
+                "year": yr,
+                "revenue": round(revenue, 2),
+                "opex": round(self.opex, 2),
+                "debt_service": round(self.annual_debt_service, 2),
+                "net_cash_flow": round(net, 2),
+            })
+        return rows
 
-    def full_analysis(self) -> dict:
-        """Return complete financial summary."""
-        return {
-            "capex_usd": self.capex,
-            "opex_annual_usd": self.opex,
-            "electricity_price_usd_mwh": self.electricity_price,
-            "project_life_years": self.life,
-            "discount_rate_pct": self.discount_rate * 100,
-            "npv_usd": self.npv(),
-            "irr_pct": self.irr(),
-            "payback_years": self.payback_period(),
-            "lcoe_usd_mwh": self.lcoe(),
-            "debt_fraction_pct": self.debt_fraction * 100,
-        }
+    def calculate_npv(self) -> float:
+        """
+        Net Present Value of equity cash flows discounted at discount_rate.
+        NPV = sum( CF_t / (1+r)^t ) for t = 0..N
+        """
+        cfs = [row["net_cash_flow"] for row in self.build_cash_flows()]
+        # npf.npv expects rate and an array starting from period 0
+        npv = float(npf.npv(self.discount_rate, cfs))
+        return round(npv, 2)
 
+    def calculate_irr(self) -> float:
+        """
+        Internal Rate of Return on equity cash flows.
+        IRR is the rate r such that NPV(r) = 0.
+        """
+        cfs = [row["net_cash_flow"] for row in self.build_cash_flows()]
+        try:
+            irr = float(npf.irr(cfs))
+            return round(irr, 6) if not np.isnan(irr) else 0.0
+        except Exception:
+            return 0.0
 
-class MonteCarloSimulator:
-    """
-    Monte Carlo simulation for financial risk analysis.
-    Varies: electricity price, energy output, CAPEX overrun.
-    """
+    def calculate_payback(self) -> float:
+        """
+        Simple payback period in years (undiscounted).
+        Counts years until cumulative net cash flow becomes positive.
+        """
+        cumulative = 0.0
+        for row in self.build_cash_flows():
+            cumulative += row["net_cash_flow"]
+            if cumulative >= 0:
+                return float(row["year"])
+        return float(self.life)  # never pays back within project life
 
-    def __init__(self, base_model: FinancialModel, n_simulations: int = 5000):
-        self.base = base_model
-        self.n = n_simulations
+    def calculate_lcoe(self) -> float:
+        """
+        Levelized Cost of Energy (USD/MWh).
+        LCOE = (CAPEX + NPV of all OPEX) / NPV of total energy produced
+        where NPV uses the project discount rate.
+        """
+        # NPV of OPEX stream
+        opex_flows = [0.0] + [self.opex] * self.life
+        npv_opex = float(npf.npv(self.discount_rate, opex_flows))
 
-    def run(self) -> dict:
-        """Run Monte Carlo and return statistics."""
-        npvs = []
-        irrs = []
-        lcoes = []
+        # NPV of energy production stream (MWh per year)
+        energy_flows = [0.0] + [self.energy] * self.life
+        npv_energy = float(npf.npv(self.discount_rate, energy_flows))
 
-        price_std = self.base.electricity_price * 0.15
-        output_std = self.base.annual_production * 0.10
-        capex_std = self.base.capex * 0.10
+        if npv_energy <= 0:
+            return 0.0
+        lcoe = (self.capex + npv_opex) / npv_energy
+        return round(lcoe, 4)
 
-        for _ in range(self.n):
-            price = max(10, np.random.normal(self.base.electricity_price, price_std))
-            output = max(1, np.random.normal(self.base.annual_production, output_std))
-            capex = max(self.base.capex * 0.8, np.random.normal(self.base.capex, capex_std))
+    def run_monte_carlo(self, simulations: int = 1000) -> Dict:
+        """
+        Monte Carlo simulation varying key inputs:
+        - electricity_price: +/-20%
+        - capex: +/-15%
+        - annual_energy: +/-10%
+        Returns p10/p50/p90 for NPV and IRR plus raw distributions.
+        """
+        npv_results = []
+        irr_results = []
+        lcoe_results = []
 
-            model = FinancialModel(
-                capex_usd=capex,
-                annual_production_mwh=output,
-                electricity_price_usd=price,
-                opex_annual_usd=self.base.opex,
-                project_life_years=self.base.life,
-                discount_rate=self.base.discount_rate,
+        for _ in range(simulations):
+            # Sample from uniform distributions around base values
+            price_var = self.price * random.uniform(0.80, 1.20)
+            capex_var = self.capex * random.uniform(0.85, 1.15)
+            energy_var = self.energy * random.uniform(0.90, 1.10)
+
+            trial = AdvancedFinancialModel(
+                capex_usd=capex_var,
+                opex_annual_usd=self.opex,
+                annual_energy_mwh=energy_var,
+                electricity_price_usd_per_mwh=price_var,
+                discount_rate=self.discount_rate,
+                project_life_years=self.life,
+                debt_ratio=self.debt_ratio,
+                debt_interest=self.debt_interest,
             )
-            npvs.append(model.npv())
-            irr = model.irr()
-            if irr is not None:
-                irrs.append(irr)
-            lcoe = model.lcoe()
-            if lcoe is not None:
-                lcoes.append(lcoe)
+            npv_results.append(trial.calculate_npv())
+            irr_results.append(trial.calculate_irr())
+            lcoe_results.append(trial.calculate_lcoe())
+
+        def percentiles(data):
+            arr = sorted(data)
+            n = len(arr)
+            return {
+                "p10": arr[int(n * 0.10)],
+                "p50": arr[int(n * 0.50)],
+                "p90": arr[int(n * 0.90)],
+                "mean": sum(arr) / n,
+            }
 
         return {
-            "simulations": self.n,
-            "npv": {
-                "mean": round(float(np.mean(npvs)), 0),
-                "std": round(float(np.std(npvs)), 0),
-                "p10": round(float(np.percentile(npvs, 10)), 0),
-                "p50": round(float(np.percentile(npvs, 50)), 0),
-                "p90": round(float(np.percentile(npvs, 90)), 0),
-                "prob_positive": round(float(np.mean([n > 0 for n in npvs])) * 100, 1),
-            },
-            "irr": {
-                "mean": round(float(np.mean(irrs)), 2) if irrs else None,
-                "p10": round(float(np.percentile(irrs, 10)), 2) if irrs else None,
-                "p90": round(float(np.percentile(irrs, 90)), 2) if irrs else None,
-            },
-            "lcoe": {
-                "mean": round(float(np.mean(lcoes)), 2) if lcoes else None,
-                "p10": round(float(np.percentile(lcoes, 10)), 2) if lcoes else None,
-                "p90": round(float(np.percentile(lcoes, 90)), 2) if lcoes else None,
-            },
+            "npv": percentiles(npv_results),
+            "irr": percentiles(irr_results),
+            "lcoe": percentiles(lcoe_results),
+            "npv_distribution": npv_results,
+            "irr_distribution": irr_results,
         }

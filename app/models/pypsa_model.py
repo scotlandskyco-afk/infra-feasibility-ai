@@ -1,190 +1,178 @@
 """
-Phase 2 — PyPSA Energy System Modelling
-Builds a realistic solar + battery network and simulates energy production.
+PyPSA-based energy network model for infrastructure feasibility analysis.
+Builds a simplified AC network, simulates solar generation, and computes
+annual production, capacity factor, and system cost.
+Falls back to a deterministic calculation if no LP solver is available.
 """
+
+import logging
+import math
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
-from typing import Optional
 
-try:
-    import pypsa
-    PYPSA_AVAILABLE = True
-except ImportError:
-    PYPSA_AVAILABLE = False
+logger = logging.getLogger(__name__)
 
 
-class SolarEnergyModel:
+def _monthly_ghi_to_hourly(monthly_ghi: Dict[int, float], capacity_mw: float) -> pd.Series:
     """
-    Simulates a solar PV project using PyPSA.
-    Inputs:
-        capacity_mw     — Installed solar capacity in MW
-        annual_ghi      — Annual GHI from NASA POWER (kWh/m2/year)
-        latitude        — Site latitude
-        battery_mwh     — Optional battery storage capacity (MWh)
-        project_name    — Label for the project
+    Expand monthly average GHI (kWh/m2/day) to an 8760-hour normalised
+    capacity factor series using a sinusoidal daily pattern.
+    Returns values in range [0, 1] representing p_max_pu for the generator.
     """
+    hours_per_month = [744, 672, 744, 720, 744, 720, 744, 744, 720, 744, 720, 744]
+    peak_ghi = max(monthly_ghi.values()) if monthly_ghi else 8.0
+
+    hourly = []
+    for month in range(1, 13):
+        ghi = monthly_ghi.get(month, peak_ghi * 0.5)
+        n_hours = hours_per_month[month - 1]
+        for h in range(n_hours):
+            hour_of_day = h % 24
+            # Sinusoidal daylight pattern: peak at solar noon (hour 12)
+            angle = math.pi * (hour_of_day - 6) / 12
+            raw = math.sin(angle) if 6 <= hour_of_day <= 18 else 0.0
+            # Scale by monthly GHI ratio relative to peak
+            pu = max(0.0, raw * (ghi / peak_ghi))
+            hourly.append(pu)
+
+    series = pd.Series(hourly[:8760], dtype=float)
+    return series
+
+
+class InfrastructurePyPSAModel:
+    """Simplified PyPSA network model for a single-bus solar generation system."""
 
     def __init__(
         self,
+        project_name: str,
         capacity_mw: float,
-        annual_ghi: float,
-        latitude: float = 30.0,
-        battery_mwh: Optional[float] = None,
-        project_name: str = "Solar Project",
+        lat: float,
+        lon: float,
+        technology: str = "solar",
+        include_battery: bool = False,
     ):
-        self.capacity_mw = capacity_mw
-        self.annual_ghi = annual_ghi
-        self.latitude = latitude
-        self.battery_mwh = battery_mwh
         self.project_name = project_name
+        self.capacity_mw = capacity_mw
+        self.lat = lat
+        self.lon = lon
+        self.technology = technology
+        self.include_battery = include_battery
         self.network = None
-        self.results = {}
+        self._results: Optional[Dict] = None
 
-    def _build_hourly_profile(self) -> np.ndarray:
+    def build_network(
+        self, solar_profile: Optional[Dict[int, float]] = None
+    ) -> None:
         """
-        Generate a synthetic 8760-hour solar capacity factor profile.
-        Uses a simplified solar geometry model scaled to the annual GHI.
+        Construct a PyPSA Network with one bus, one generator,
+        one load, and optionally a battery storage unit.
         """
-        hours = np.arange(8760)
-        day_of_year = hours // 24
-        hour_of_day = hours % 24
+        try:
+            import pypsa  # noqa: PLC0415
+        except ImportError:
+            logger.warning("PyPSA not installed; will use analytic fallback.")
+            self.network = None
+            self._solar_profile = solar_profile or {}
+            return
 
-        # Solar declination and zenith approximation
-        declination = 23.45 * np.sin(np.radians((360 / 365) * (day_of_year - 81)))
-        lat_rad = np.radians(self.latitude)
-        dec_rad = np.radians(declination)
-        hour_angle = np.radians((hour_of_day - 12) * 15)
+        if solar_profile is None:
+            # Default flat 20% capacity factor if no profile supplied
+            solar_profile = {m: 5.0 for m in range(1, 13)}
 
-        cos_zenith = (
-            np.sin(lat_rad) * np.sin(dec_rad)
-            + np.cos(lat_rad) * np.cos(dec_rad) * np.cos(hour_angle)
-        )
-        cf = np.maximum(cos_zenith, 0)
+        p_max_pu = _monthly_ghi_to_hourly(solar_profile, self.capacity_mw)
+        snapshots = pd.date_range("2023-01-01", periods=8760, freq="h")
 
-        # Scale to match annual GHI
-        peak_ghi_per_hour = self.annual_ghi / 365 / 6  # rough peak hours
-        cf_scaled = cf * peak_ghi_per_hour
-        cf_normalized = cf_scaled / (self.capacity_mw * 1000) if self.capacity_mw > 0 else cf_scaled
-        cf_clipped = np.clip(cf_normalized, 0, 1)
-        return cf_clipped
+        network = pypsa.Network()
+        network.set_snapshots(snapshots)
 
-    def build_network(self) -> None:
-        """Construct the PyPSA network."""
-        if not PYPSA_AVAILABLE:
-            raise RuntimeError("PyPSA is not installed. Run: pip install pypsa")
+        network.add("Bus", "main_bus", v_nom=33.0)
 
-        snapshots = pd.date_range("2024-01-01", periods=8760, freq="h")
-        cf_profile = self._build_hourly_profile()
-        solar_series = pd.Series(cf_profile, index=snapshots)
-
-        n = pypsa.Network()
-        n.set_snapshots(snapshots)
-
-        # Main bus
-        n.add("Bus", "main_bus", carrier="AC")
-
-        # Solar generator
-        n.add(
+        network.add(
             "Generator",
-            "solar_pv",
+            "solar_gen",
             bus="main_bus",
-            carrier="solar",
             p_nom=self.capacity_mw,
-            p_max_pu=solar_series,
+            p_max_pu=p_max_pu.values,
+            carrier="solar",
             marginal_cost=0.0,
-            capital_cost=0.0,  # handled in financial model
+            capital_cost=0.0,
         )
 
-        # Load (representative average demand)
-        avg_load_mw = self.capacity_mw * 0.7
-        load_profile = pd.Series(avg_load_mw, index=snapshots)
-        n.add("Load", "demand", bus="main_bus", p_set=load_profile)
+        # Load set at 80 % of nameplate capacity
+        load_profile = pd.Series(
+            self.capacity_mw * 0.8, index=snapshots, dtype=float
+        )
+        network.add("Load", "demand", bus="main_bus", p_set=load_profile.values)
 
-        # Battery storage (optional)
-        if self.battery_mwh:
-            n.add(
+        if self.include_battery:
+            network.add(
                 "StorageUnit",
                 "battery",
                 bus="main_bus",
-                carrier="battery",
-                p_nom=self.battery_mwh / 4,  # C-rate: 4-hour battery
+                p_nom=self.capacity_mw * 0.25,
                 max_hours=4,
-                efficiency_store=0.92,
-                efficiency_dispatch=0.92,
-                cyclic_state_of_charge=True,
+                efficiency_store=0.95,
+                efficiency_dispatch=0.95,
+                capital_cost=0.0,
+                marginal_cost=0.0,
             )
 
-        self.network = n
+        self.network = network
+        self._solar_profile = solar_profile
 
-    def run_simulation(self) -> dict:
-        """Run PyPSA simulation and extract key results."""
+    def run_simulation(self) -> None:
+        """Run the network optimisation (LOPF). Falls back gracefully."""
         if self.network is None:
-            self.build_network()
-
+            logger.info("No PyPSA network; using analytic fallback.")
+            return
         try:
-            self.network.optimize(solver_name="glpk")
-            solve_status = "optimal"
-        except Exception:
-            # Fallback: linear approximation without solver
-            solve_status = "approximated"
+            status, condition = self.network.lopf(
+                self.network.snapshots,
+                solver_name="highs",
+                pyomo=False,
+            )
+            if status != "ok":
+                logger.warning("LOPF status: %s — %s", status, condition)
+        except Exception as exc:
+            logger.warning("LOPF failed (%s); using analytic fallback.", exc)
 
-        # Extract results
-        solar_gen = self.network.generators_t.p.get("solar_pv", pd.Series(dtype=float))
-        total_production_mwh = float(solar_gen.sum()) if not solar_gen.empty else self._estimate_production()
-        capacity_factor = total_production_mwh / (self.capacity_mw * 8760) if self.capacity_mw > 0 else 0
+    def get_results(self) -> Dict:
+        """Return key energy performance metrics."""
+        if self.network is not None:
+            try:
+                gen = self.network.generators_t.p.get("solar_gen")
+                if gen is not None and not gen.empty:
+                    annual_mwh = float(gen.sum())
+                    capacity_factor = annual_mwh / (self.capacity_mw * 8760)
+                    load_served = float(self.network.loads_t.p.get("demand", pd.Series(0)).sum())
+                    curtailment_pct = max(
+                        0.0, (annual_mwh - load_served) / annual_mwh * 100
+                    ) if annual_mwh > 0 else 0.0
+                    system_cost = self.capacity_mw * 900_000  # $900/kW default CAPEX proxy
+                    return {
+                        "annual_production_mwh": round(annual_mwh, 1),
+                        "capacity_factor": round(capacity_factor, 4),
+                        "curtailment_pct": round(curtailment_pct, 2),
+                        "system_cost_usd": round(system_cost, 0),
+                        "solver": "lopf",
+                    }
+            except Exception as exc:
+                logger.warning("Results extraction failed: %s", exc)
 
-        self.results = {
-            "project_name": self.project_name,
-            "installed_capacity_mw": self.capacity_mw,
-            "annual_production_mwh": round(total_production_mwh, 2),
-            "capacity_factor_pct": round(capacity_factor * 100, 2),
-            "battery_storage_mwh": self.battery_mwh,
-            "annual_ghi_kwh_m2": self.annual_ghi,
-            "solve_status": solve_status,
-            "peak_output_mw": float(solar_gen.max()) if not solar_gen.empty else self.capacity_mw,
-        }
-        return self.results
-
-    def _estimate_production(self) -> float:
-        """Fallback estimate: capacity * annual_ghi-based capacity factor."""
-        # Typical CF from GHI: CF ≈ GHI / (365 * 24 * peak_sun_factor)
-        peak_sun_hours = self.annual_ghi / 1000
-        return self.capacity_mw * peak_sun_hours
-
-
-class WindEnergyModel:
-    """
-    Simplified wind energy model for onshore or offshore wind projects.
-    Uses a Rayleigh wind speed distribution.
-    """
-
-    def __init__(self, capacity_mw: float, mean_wind_speed_ms: float, project_name: str = "Wind Project"):
-        self.capacity_mw = capacity_mw
-        self.mean_wind_speed_ms = mean_wind_speed_ms
-        self.project_name = project_name
-
-    def estimate_capacity_factor(self) -> float:
-        """Estimate CF from mean wind speed using Rayleigh distribution."""
-        v = self.mean_wind_speed_ms
-        # Empirical CF curve approximation for modern turbines
-        if v < 3:
-            return 0.05
-        elif v < 5:
-            return 0.10 + (v - 3) * 0.05
-        elif v < 8:
-            return 0.20 + (v - 5) * 0.06
-        elif v < 12:
-            return 0.38 + (v - 8) * 0.02
-        else:
-            return 0.45
-
-    def run_simulation(self) -> dict:
-        cf = self.estimate_capacity_factor()
-        annual_production = self.capacity_mw * cf * 8760
+        # ---- Analytic fallback ----
+        profile = getattr(self, "_solar_profile", {m: 5.0 for m in range(1, 13)})
+        avg_ghi = sum(profile.values()) / max(len(profile), 1) if profile else 5.0
+        # Capacity factor approximation: GHI(kWh/m2/day) / 24 as fraction of peak
+        peak_ghi = 10.0  # theoretical max kWh/m2/day
+        capacity_factor = min(avg_ghi / peak_ghi, 1.0)
+        annual_mwh = self.capacity_mw * capacity_factor * 8760
+        system_cost = self.capacity_mw * 900_000
         return {
-            "project_name": self.project_name,
-            "installed_capacity_mw": self.capacity_mw,
-            "annual_production_mwh": round(annual_production, 2),
-            "capacity_factor_pct": round(cf * 100, 2),
-            "mean_wind_speed_ms": self.mean_wind_speed_ms,
+            "annual_production_mwh": round(annual_mwh, 1),
+            "capacity_factor": round(capacity_factor, 4),
+            "curtailment_pct": 0.0,
+            "system_cost_usd": round(system_cost, 0),
+            "solver": "analytic_fallback",
         }
